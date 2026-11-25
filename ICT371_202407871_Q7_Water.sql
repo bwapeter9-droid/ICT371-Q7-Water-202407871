@@ -170,24 +170,37 @@ BEGIN
 END;
 $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_cron;
 
-SELECT cron.schedule('q7_refresh_receivables', '30 0 * * *',
-                     $$CALL q7_water.pr_refresh_receivables()$$);
+-- Safe scheduling: runs only if pg_cron is available on this server.
+-- If it is not installed you will just see a NOTICE and the rest of the script still works.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_cron') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_cron;
+        PERFORM cron.schedule('q7_refresh_receivables', '30 0 * * *', $cmd$CALL q7_water.pr_refresh_receivables()$cmd$);
+        RAISE NOTICE 'Job q7_refresh_receivables scheduled: 30 0 * * *';
+    ELSE
+        RAISE NOTICE 'pg_cron is not installed on this server - job NOT scheduled. Schedule used: 30 0 * * *';
+    END IF;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Could not schedule job (q7_refresh_receivables): %', SQLERRM;
+END
+$do$;
 
-SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q7_refresh_receivables';
+-- Inspect job / history (uncomment where pg_cron is installed):
+-- SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname = 'q7_refresh_receivables';
 -- SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
 
 -- =====================================================================
 -- TESTS / EVIDENCE
 -- =====================================================================
-\echo '--- (a) Data ---'
+SELECT '--- (a) Data ---' AS section;
 SELECT r.reading_id, r.customer_id, r.reading_month, r.previous_reading, r.current_reading,
        r.current_reading - r.previous_reading AS units
 FROM readings r ORDER BY r.reading_id;
 SELECT * FROM bills ORDER BY bill_id;
 
-\echo '--- (b) Function ---'
+SELECT '--- (b) Function ---' AS section;
 SELECT fn_water_charge(0) AS c0, fn_water_charge(10) AS c10, fn_water_charge(15) AS c15,
        fn_water_charge(12.5) AS c12_5;                    -- 0.00, 50.00, 90.00, 70.00
 DO $$ BEGIN PERFORM fn_water_charge(NULL);
@@ -195,7 +208,7 @@ DO $$ BEGIN PERFORM fn_water_charge(NULL);
 DO $$ BEGIN PERFORM fn_water_charge(-1);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (negative): %', SQLERRM; END $$;
 
-\echo '--- (c) Procedure ---'
+SELECT '--- (c) Procedure ---' AS section;
 CALL pr_generate_bill(5, CURRENT_DATE + 20);              -- valid: 15 units -> 90.00
 DO $$ BEGIN CALL pr_generate_bill(5, CURRENT_DATE + 20);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (already billed): %', SQLERRM; END $$;
@@ -203,7 +216,7 @@ DO $$ BEGIN CALL pr_generate_bill(999, CURRENT_DATE);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (unknown reading): %', SQLERRM; END $$;
 SELECT * FROM bills ORDER BY bill_id;
 
-\echo '--- (d) Trigger: bad reading rejected and not stored ---'
+SELECT '--- (d) Trigger: bad reading rejected and not stored ---' AS section;
 DO $$ BEGIN INSERT INTO readings (customer_id, reading_month, previous_reading, current_reading)
             VALUES (1, (date_trunc('month', CURRENT_DATE) + INTERVAL '1 month')::DATE, 200, 150);
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (insert): %', SQLERRM; END $$;
@@ -211,15 +224,15 @@ DO $$ BEGIN UPDATE readings SET current_reading = 1 WHERE reading_id = 6;   -- 3
    EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'EXPECTED ERROR (update): %', SQLERRM; END $$;
 SELECT COUNT(*) AS readings_still_6 FROM readings;
 
-\echo '--- (e) View: only bill 2 (30.00 outstanding) is overdue and unpaid ---'
+SELECT '--- (e) View: only bill 2 (30.00 outstanding) is overdue and unpaid ---' AS section;
 SELECT * FROM v_overdue_bills;
 
-\echo '--- (f) EXPLAIN ---'
+SELECT '--- (f) EXPLAIN ---' AS section;
 SET enable_seqscan = off;
 EXPLAIN SELECT * FROM bills WHERE due_on < CURRENT_DATE AND amount_paid < charge;
 RESET enable_seqscan;
 
-\echo '--- (g) Run twice: same date replaced ---'
+SELECT '--- (g) Run twice: same date replaced ---' AS section;
 CALL pr_refresh_receivables();
 SELECT * FROM receivable_snapshot;                         -- 30 + 40 + 90 = 160.00
 CALL pr_refresh_receivables();
